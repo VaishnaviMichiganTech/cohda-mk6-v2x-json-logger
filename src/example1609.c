@@ -215,6 +215,7 @@
 #include "spatmap-log/spatmap-log.h"
 #include "sdsm-log/sdsm-log.h" //addedbyvaishnavi
 #include "bsm-log/bsm-log.h"   //addedbyvaishnavi
+#include "tx-log/tx-log.h"     //addedbyvaishnavi
 #ifdef PVDM
 #include "PVDM.h"
 #endif
@@ -606,6 +607,8 @@ int main (int Argc, char ** ppArgv)
       d_printf(D_WARN,NULL,"BSMLog_Init failed: %d\n",LRes);
   }
 
+  // TX latency logger — always-on; only writes when TX modules call TxLog_Record
+  TxLog_Init();
 
   if (pApp->Cfg.RSATx)
   {
@@ -885,6 +888,7 @@ int main (int Argc, char ** ppArgv)
   }
   if (pApp->Cfg.BSMLog)
     BSMLog_Exit();
+  TxLog_Exit();
   App_Exit();
   Stack_Exit();
 

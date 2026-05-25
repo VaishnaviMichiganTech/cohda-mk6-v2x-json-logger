@@ -15,6 +15,7 @@
 //------------------------------------------------------------------------------
 
 #include "spat-tx.h"
+#include "tx-log.h"
 
 #include "libconfig.h" // used to read configuration file
 
@@ -885,6 +886,7 @@ static int SPATTx_TransmitSPAT (struct SPATTx *pSPAT)
   int Res;
   uint8_t *pWSM = NULL;
   int WSMSize;
+  static int s_spat_seq = 0;
 
   if (pSPAT->pASN == NULL)
   {
@@ -935,6 +937,12 @@ static int SPATTx_TransmitSPAT (struct SPATTx *pSPAT)
   // Add the WSM Header to the UPER encoded buffer
   SPATTx_PopulateWSMHeader(pSPAT, (struct Dot3WSMPHdr *) pWSM, WSMSize);
 
+  // Stamp the pre-send time for TX latency measurement.
+  // gettimeofday uses the GPS-disciplined system clock (UTC microseconds).
+  struct timeval tv_pre;
+  gettimeofday(&tv_pre, NULL);
+  uint64_t t_pre_us = (uint64_t)tv_pre.tv_sec * 1000000ULL + (uint64_t)tv_pre.tv_usec;
+
   // Transmit the WSM.
   // Enable signing (might be fake sig if security is disabled)
   // Also disable Tx logging.
@@ -948,6 +956,8 @@ static int SPATTx_TransmitSPAT (struct SPATTx *pSPAT)
   }
   else
   {
+    // Log after send so P1609TX_GetLastTx() returns data for this packet.
+    TxLog_Record((struct Dot3WSMPHdr *)pWSM, "SPAT", s_spat_seq++, t_pre_us);
     // "Sent SPAT (%d bytes)", WSMSize);
   }
 

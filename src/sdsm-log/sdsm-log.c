@@ -22,6 +22,7 @@
 
 /* Cohda v2x-lib */
 #include "asn1defs.h"      /* asn1_jer_encode2(), asn1_free(), ASN1JERParams   */
+#include "dot3-wsmp.h"     /* tDot3WSMPHdr, per-packet MAC metadata            */
 #include "ext.h"           /* Ext_CallbackRegister / Deregister, tExtMessage  */
 #include "id-global.h"     /* QSMSG_EXT_RX_WSM                                */
 #include "j2735asn.h"      /* SAESensorDataSharingMessage, SAEDetectedObject*  */
@@ -181,17 +182,47 @@ static void SDSMLog_ReadConfig(const char *pCfgFile,
 /*----------------------------------------------------------------------------*/
 /* Log_JER — JER-encode the full decoded struct and write/forward it         */
 /*----------------------------------------------------------------------------*/
-static void Log_JER(const char      *msg_type,
-                    const ASN1CType *pType,
-                    const void      *pDecoded,
-                    uint64_t         now_ms)
+static void Log_JER(const char           *msg_type,
+                    const ASN1CType      *pType,
+                    const void           *pDecoded,
+                    uint64_t              now_ms,
+                    const tDot3WSMPHdr   *pWSM)
 {
     if (pType == NULL || pDecoded == NULL) return;
 
-    char prefix[256];
-    int  prefix_len = snprintf(prefix, sizeof(prefix),
-        "{\n  \"msg_type\": \"%s\",\n  \"ts_rx_ms\": %" PRIu64 ",\n  \"message\": ",
-        msg_type, now_ms);
+    char prefix[512];
+    int  prefix_len;
+
+    if (pWSM != NULL) {
+        const uint8_t *sa = pWSM->Rx.SA;
+        float cbr_pct = (float)ntohl(pWSM->ChannelLoad) * 100.0f / 65535.0f;
+        prefix_len = snprintf(prefix, sizeof(prefix),
+            "{\n"
+            "  \"msg_type\": \"%s\",\n"
+            "  \"ts_rx_ms\": %" PRIu64 ",\n"
+            "  \"mac\": {\n"
+            "    \"rssi_dbm\": %d,\n"
+            "    \"data_rate_mbps\": %.1f,\n"
+            "    \"channel\": %u,\n"
+            "    \"cbr_pct\": %.2f,\n"
+            "    \"payload_bytes\": %u,\n"
+            "    \"sa\": \"%02x:%02x:%02x:%02x:%02x:%02x\",\n"
+            "    \"psid\": %u\n"
+            "  },\n"
+            "  \"message\": ",
+            msg_type, now_ms,
+            (int)pWSM->Rx.RSSI,
+            (float)pWSM->DataRate * 0.5f,
+            (unsigned)pWSM->ChannelNumber,
+            cbr_pct,
+            (unsigned)ntohs(pWSM->Length),
+            sa[0], sa[1], sa[2], sa[3], sa[4], sa[5],
+            ntohl(pWSM->PSID));
+    } else {
+        prefix_len = snprintf(prefix, sizeof(prefix),
+            "{\n  \"msg_type\": \"%s\",\n  \"ts_rx_ms\": %" PRIu64 ",\n  \"message\": ",
+            msg_type, now_ms);
+    }
     if (prefix_len < 0 || prefix_len >= (int)sizeof(prefix)) return;
 
     static const char   suffix[]   = "\n}\n";
@@ -265,7 +296,7 @@ static void SDSMLog_ExtCallback(tExtEventId Event,
 
     uint64_t now_ms = Util_Now();
     fprintf(stderr, "SDSMLog: SDSM rx -- %zu object(s)\n", pSDSM->objects.count);
-    Log_JER("SDSM", asn1_type_SAESensorDataSharingMessage, pSDSM, now_ms);
+    Log_JER("SDSM", asn1_type_SAESensorDataSharingMessage, pSDSM, now_ms, pMsg->pWSM);
 }
 
 /*----------------------------------------------------------------------------*/

@@ -16,6 +16,7 @@
 
 #include "Example1609_defn.h"
 #include "sdsm-tx.h"
+#include "tx-log.h"
 
 #include "libconfig.h" // used to read configuration file
 
@@ -1121,6 +1122,7 @@ static int SDSMTx_TransmitSDSM (struct SDSMTx *pSDSM,
   int WSMSize;
   uint8_t *pWSM = NULL;
   struct SAESensorDataSharingMessage *pASN = NULL;
+  static int s_sdsm_seq = 0;
 
   // Create the ASN.1 structure
   Res = SDSMTx_CreateSDSM(pSDSM, &pASN);
@@ -1165,6 +1167,11 @@ static int SDSMTx_TransmitSDSM (struct SDSMTx *pSDSM,
   // Add the WSM Header to the BER encoded buffer
   SDSMTx_PopulateWSMHeader(pSDSM, (struct Dot3WSMPHdr *) pWSM, WSMSize);
 
+  // Stamp the pre-send time for TX latency measurement.
+  struct timeval tv_pre;
+  gettimeofday(&tv_pre, NULL);
+  uint64_t t_pre_us = (uint64_t)tv_pre.tv_sec * 1000000ULL + (uint64_t)tv_pre.tv_usec;
+
   // Transmit the WSM.
   // Enable signing (might be fake sig if security is disabled)
   // Also disable Tx logging.
@@ -1178,6 +1185,7 @@ static int SDSMTx_TransmitSDSM (struct SDSMTx *pSDSM,
   }
   else
   {
+    TxLog_Record((struct Dot3WSMPHdr *)pWSM, "SDSM", s_sdsm_seq++, t_pre_us);
     // "Sent SDSM (%d bytes)", WSMSize);
   }
 

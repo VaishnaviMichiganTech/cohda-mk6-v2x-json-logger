@@ -157,18 +157,48 @@ static void SpatMapLog_ReadConfig(const char *pCfgFile,
  * jer_buf is heap-allocated by asn1_jer_encode2() with no size cap; it is freed
  * with asn1_free() after both the file write and UDP send complete.
  */
-static void Log_JER(const char      *msg_type,
-                    const ASN1CType *pType,
-                    const void      *pDecoded,
-                    uint64_t         now_ms)
+static void Log_JER(const char           *msg_type,
+                    const ASN1CType      *pType,
+                    const void           *pDecoded,
+                    uint64_t              now_ms,
+                    const tDot3WSMPHdr   *pWSM)
 {
     if (pType == NULL || pDecoded == NULL) return;
 
-    /* --- Build the envelope prefix on the stack (~80 bytes, always fits) --- */
-    char prefix[256];
-    int  prefix_len = snprintf(prefix, sizeof(prefix),
-        "{\n  \"msg_type\": \"%s\",\n  \"ts_rx_ms\": %" PRIu64 ",\n  \"message\": ",
-        msg_type, now_ms);
+    /* --- Build the envelope prefix, including MAC metadata block --- */
+    char prefix[512];
+    int  prefix_len;
+
+    if (pWSM != NULL) {
+        const uint8_t *sa = pWSM->Rx.SA;
+        float cbr_pct = (float)ntohl(pWSM->ChannelLoad) * 100.0f / 65535.0f;
+        prefix_len = snprintf(prefix, sizeof(prefix),
+            "{\n"
+            "  \"msg_type\": \"%s\",\n"
+            "  \"ts_rx_ms\": %" PRIu64 ",\n"
+            "  \"mac\": {\n"
+            "    \"rssi_dbm\": %d,\n"
+            "    \"data_rate_mbps\": %.1f,\n"
+            "    \"channel\": %u,\n"
+            "    \"cbr_pct\": %.2f,\n"
+            "    \"payload_bytes\": %u,\n"
+            "    \"sa\": \"%02x:%02x:%02x:%02x:%02x:%02x\",\n"
+            "    \"psid\": %u\n"
+            "  },\n"
+            "  \"message\": ",
+            msg_type, now_ms,
+            (int)pWSM->Rx.RSSI,
+            (float)pWSM->DataRate * 0.5f,
+            (unsigned)pWSM->ChannelNumber,
+            cbr_pct,
+            (unsigned)ntohs(pWSM->Length),
+            sa[0], sa[1], sa[2], sa[3], sa[4], sa[5],
+            ntohl(pWSM->PSID));
+    } else {
+        prefix_len = snprintf(prefix, sizeof(prefix),
+            "{\n  \"msg_type\": \"%s\",\n  \"ts_rx_ms\": %" PRIu64 ",\n  \"message\": ",
+            msg_type, now_ms);
+    }
     if (prefix_len < 0 || prefix_len >= (int)sizeof(prefix)) {
         fprintf(stderr, "SpatMapLog: prefix snprintf overflow\n");
         return;
@@ -251,7 +281,7 @@ static void SpatMapLog_ExtCallback(tExtEventId  Event,
         pMsg->pSAESPAT != NULL) {
         fprintf(stderr, "SpatMapLog: SPAT rx -- %zu intersection(s)\n",
                 pMsg->pSAESPAT->intersections.count);
-        Log_JER("SPAT", asn1_type_SAESPAT, pMsg->pSAESPAT, now_ms);
+        Log_JER("SPAT", asn1_type_SAESPAT, pMsg->pSAESPAT, now_ms, pMsg->pWSM);
         return;
     }
     if (pMsg->pType == (const uintptr_t *)asn1_type_SAEMapData &&
@@ -259,7 +289,7 @@ static void SpatMapLog_ExtCallback(tExtEventId  Event,
         size_t ni = pMsg->pSAEMAP->intersections_option
                     ? pMsg->pSAEMAP->intersections.count : 0;
         fprintf(stderr, "SpatMapLog: MAP rx -- %zu intersection(s)\n", ni);
-        Log_JER("MAP", asn1_type_SAEMapData, pMsg->pSAEMAP, now_ms);
+        Log_JER("MAP", asn1_type_SAEMapData, pMsg->pSAEMAP, now_ms, pMsg->pWSM);
         return;
     }
 }

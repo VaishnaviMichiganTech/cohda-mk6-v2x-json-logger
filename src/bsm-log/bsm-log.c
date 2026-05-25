@@ -27,6 +27,7 @@
 
 #include "asn1defs.h"
 #include "J2735_BSM.h"
+#include "dot3-wsmp.h"
 #include "ext.h"
 #include "id-global.h"
 #include "j2735asn.h"
@@ -143,17 +144,47 @@ static void BSMLog_ReadConfig(const char *pCfgFile,
     remove(tmpPath);
 }
 
-static void Log_JER(const char      *msg_type,
-                    const ASN1CType *pType,
-                    const void      *pDecoded,
-                    uint64_t         now_ms)
+static void Log_JER(const char           *msg_type,
+                    const ASN1CType      *pType,
+                    const void           *pDecoded,
+                    uint64_t              now_ms,
+                    const tDot3WSMPHdr   *pWSM)
 {
     if (pType == NULL || pDecoded == NULL) return;
 
-    char prefix[256];
-    int  prefix_len = snprintf(prefix, sizeof(prefix),
-        "{\n  \"msg_type\": \"%s\",\n  \"ts_rx_ms\": %" PRIu64 ",\n  \"message\": ",
-        msg_type, now_ms);
+    char prefix[512];
+    int  prefix_len;
+
+    if (pWSM != NULL) {
+        const uint8_t *sa  = pWSM->Rx.SA;
+        float cbr_pct = (float)ntohl(pWSM->ChannelLoad) * 100.0f / 65535.0f;
+        prefix_len = snprintf(prefix, sizeof(prefix),
+            "{\n"
+            "  \"msg_type\": \"%s\",\n"
+            "  \"ts_rx_ms\": %" PRIu64 ",\n"
+            "  \"mac\": {\n"
+            "    \"rssi_dbm\": %d,\n"
+            "    \"data_rate_mbps\": %.1f,\n"
+            "    \"channel\": %u,\n"
+            "    \"cbr_pct\": %.2f,\n"
+            "    \"payload_bytes\": %u,\n"
+            "    \"sa\": \"%02x:%02x:%02x:%02x:%02x:%02x\",\n"
+            "    \"psid\": %u\n"
+            "  },\n"
+            "  \"message\": ",
+            msg_type, now_ms,
+            (int)pWSM->Rx.RSSI,
+            (float)pWSM->DataRate * 0.5f,
+            (unsigned)pWSM->ChannelNumber,
+            cbr_pct,
+            (unsigned)ntohs(pWSM->Length),
+            sa[0], sa[1], sa[2], sa[3], sa[4], sa[5],
+            ntohl(pWSM->PSID));
+    } else {
+        prefix_len = snprintf(prefix, sizeof(prefix),
+            "{\n  \"msg_type\": \"%s\",\n  \"ts_rx_ms\": %" PRIu64 ",\n  \"message\": ",
+            msg_type, now_ms);
+    }
     if (prefix_len < 0 || prefix_len >= (int)sizeof(prefix)) return;
 
     static const char   suffix[]   = "\n}\n";
@@ -221,7 +252,7 @@ static void BSMLog_ExtCallback(tExtEventId  Event,
             pMsg->pBSM->coreData.Long * 1e-7,
             pMsg->pBSM->coreData.speed * 0.02);
 
-    Log_JER("BSM", asn1_type_SAEBasicSafetyMessage, pMsg->pBSM, now_ms);
+    Log_JER("BSM", asn1_type_SAEBasicSafetyMessage, pMsg->pBSM, now_ms, pMsg->pWSM);
 }
 
 int BSMLog_Init(const char *pStackConfigFilename)

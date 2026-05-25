@@ -14,6 +14,7 @@
 //------------------------------------------------------------------------------
 
 #include "map-tx.h"
+#include "tx-log.h"
 
 #include "libconfig.h" // used to read configuration file
 
@@ -870,6 +871,7 @@ static int MAPTx_TransmitMAP (struct MAPTx *pMAP)
   struct SAEMapData *pASN = NULL;
   uint8_t *pWSM = NULL;
   int WSMSize;
+  static int s_map_seq = 0;
 
   // Create the ASN.1 structure
   Res = MAPTx_CreateMAP(pMAP, &pASN, &(pMAP->Params.Cfg));
@@ -912,6 +914,11 @@ static int MAPTx_TransmitMAP (struct MAPTx *pMAP)
   // Add the WSM Header to the UPER encoded buffer
   MAPTx_PopulateWSMHeader(pMAP, (struct Dot3WSMPHdr *) pWSM, WSMSize);
 
+  // Stamp the pre-send time for TX latency measurement.
+  struct timeval tv_pre;
+  gettimeofday(&tv_pre, NULL);
+  uint64_t t_pre_us = (uint64_t)tv_pre.tv_sec * 1000000ULL + (uint64_t)tv_pre.tv_usec;
+
   // Transmit the WSM.
   // Enable signing (might be fake sig if security is disabled)
   // Also disable Tx logging.
@@ -926,6 +933,7 @@ static int MAPTx_TransmitMAP (struct MAPTx *pMAP)
   }
   else
   {
+    TxLog_Record((struct Dot3WSMPHdr *)pWSM, "MAP", s_map_seq++, t_pre_us);
     // "Sent MAP (%d bytes)", WSMSize);
   }
 
