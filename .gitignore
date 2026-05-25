@@ -1,0 +1,23 @@
+# Build output directories (cross-compiled binaries, .o files, libs)
+mk6/
+x86/
+arm/
+
+# Build artifacts
+*.o
+*.tgz
+*.tar.gz
+
+# Log output
+*.jsonl
+*.pcap
+
+# Temp config files created by loggers at runtime
+/tmp/bsmlog_*.conf
+/tmp/sdsmlog_*.conf
+/tmp/spatmaplog_*.conf
+
+# Editor / OS
+.DS_Store
+*.swp
+*~

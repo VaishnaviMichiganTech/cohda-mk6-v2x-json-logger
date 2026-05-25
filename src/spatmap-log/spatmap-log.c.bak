@@ -1,0 +1,398 @@
+// spatmap-log.c
+//
+// Author: Vaishnavi Balambeed
+//
+// Logs SPAT and MAP messages to a JSONL file and forwards each JSON
+// message over UDP simultaneously.
+//
+// DESIGN: Uses a raw Ext WSM callback (same pattern as sdsm-log.c)
+// instead of the SPATMAP framework. This means:
+//   - NO relevance filtering  — every received SPAT and MAP is logged
+//   - NO distance check       — intersection does not need to be nearby
+//   - NO IsRelevant gate      — callback fires on every received packet
+//
+// Filters only on:
+//   pMsg->pSAESPAT != NULL   → log as SPAT (ProtocolMode=1 / SAE J2735)
+//   pMsg->pSAEMAP  != NULL   → log as MAP  (ProtocolMode=1 / SAE J2735)
+//
+// Add to obu.conf BEFORE the % include lines:
+//
+//   SpatMapLog:
+//   {
+//       UDP_Host = "192.168.222.1";
+//       UDP_Port = 5005;
+//   };
+//
+// Set UDP_Port = 0 to disable UDP (file logging only).
+// If keys are absent, defaults (127.0.0.1:5005) are used.
+
+#include "spatmap-log.h"
+
+#include "ext.h"        /* Ext_CallbackRegister/Deregister, tExtMessage      */
+#include "id-global.h"  /* QSMSG_EXT_RX_WSM                                  */
+#include "j2735asn.h"   /* SAESPAT, SAEMapData, SAEMovementState, etc.        */
+#include "log.h"        /* Log_GetLogDir()                                    */
+#include "util.h"       /* Util_Now()                                         */
+#include "libconfig.h"  /* config_t                                           */
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+/*----------------------------------------------------------------------------*/
+/* Config                                                                     */
+/*----------------------------------------------------------------------------*/
+#define SPATMAPLOG_CFG_HOST      "SpatMapLog.UDP_Host"
+#define SPATMAPLOG_CFG_PORT      "SpatMapLog.UDP_Port"
+#define SPATMAPLOG_DEFAULT_HOST  "127.0.0.1"
+#define SPATMAPLOG_DEFAULT_PORT  5005
+
+/*----------------------------------------------------------------------------*/
+/* Static state                                                               */
+/*----------------------------------------------------------------------------*/
+static FILE              *g_log_fp      = NULL;
+static int                g_udp_fd      = -1;
+static struct sockaddr_in g_udp_dest;
+static int                g_ext_handle  = -1;
+static volatile int       g_initialized = 0;
+
+/* 32 KB covers a full MAP message comfortably */
+static char s_udp_buf[32768];
+
+/*----------------------------------------------------------------------------*/
+/* LOGF macro                                                                 */
+/*----------------------------------------------------------------------------*/
+#define LOGF(fmt, ...) \
+    do { \
+        if (g_log_fp) \
+            fprintf(g_log_fp, fmt, ##__VA_ARGS__); \
+        if (n < (int)sizeof(s_udp_buf) - 1) { \
+            n += snprintf(s_udp_buf + n, \
+                          sizeof(s_udp_buf) - (size_t)n, \
+                          fmt, ##__VA_ARGS__); \
+        } \
+    } while (0)
+
+/*----------------------------------------------------------------------------*/
+/* Block-extraction config reader                                             */
+/*----------------------------------------------------------------------------*/
+static void SpatMapLog_ReadConfig(const char *pCfgFile,
+                                  char       *pHostOut,
+                                  size_t      hostBufLen,
+                                  int        *pPortOut)
+{
+    strncpy(pHostOut, SPATMAPLOG_DEFAULT_HOST, hostBufLen - 1);
+    pHostOut[hostBufLen - 1] = '\0';
+    *pPortOut = SPATMAPLOG_DEFAULT_PORT;
+
+    if (pCfgFile == NULL) return;
+
+    char tmpPath[256];
+    snprintf(tmpPath, sizeof(tmpPath), "/tmp/spatmaplog_%d.conf",
+             (int)getpid());
+
+    FILE *fin  = fopen(pCfgFile, "r");
+    FILE *fout = fopen(tmpPath, "w");
+
+    if (!fin || !fout) {
+        fprintf(stderr, "SpatMapLog: cannot open %s, using defaults\n",
+                pCfgFile);
+        if (fin)  fclose(fin);
+        if (fout) fclose(fout);
+        return;
+    }
+
+    char line[512];
+    int  in_block    = 0;
+    int  brace_depth = 0;
+
+    while (fgets(line, sizeof(line), fin)) {
+        char *trimmed = line;
+        while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+        if (!in_block) {
+            if (strncmp(trimmed, "SpatMapLog", 10) == 0 &&
+                strchr(trimmed, ':')) {
+                in_block = 1;
+                brace_depth = 0;
+                fputs(line, fout);
+            }
+        } else {
+            for (char *p = line; *p; p++) {
+                if (*p == '{') brace_depth++;
+                if (*p == '}') brace_depth--;
+            }
+            fputs(line, fout);
+            if (brace_depth <= 0) break;
+        }
+    }
+    fclose(fin);
+    fclose(fout);
+
+    config_t cfg;
+    config_init(&cfg);
+
+    if (config_read_file(&cfg, tmpPath) != CONFIG_TRUE) {
+        fprintf(stderr,
+                "SpatMapLog: could not parse extracted block (%s), "
+                "using defaults\n", config_error_text(&cfg));
+        config_destroy(&cfg);
+        remove(tmpPath);
+        return;
+    }
+
+    const char *host = NULL;
+    if (config_lookup_string(&cfg, SPATMAPLOG_CFG_HOST, &host) == CONFIG_TRUE) {
+        strncpy(pHostOut, host, hostBufLen - 1);
+        pHostOut[hostBufLen - 1] = '\0';
+    }
+    int port = 0;
+    if (config_lookup_int(&cfg, SPATMAPLOG_CFG_PORT, &port) == CONFIG_TRUE)
+        *pPortOut = port;
+
+    config_destroy(&cfg);
+    remove(tmpPath);
+}
+
+/*----------------------------------------------------------------------------*/
+/* UDP send                                                                   */
+/*----------------------------------------------------------------------------*/
+static void SendUDP(int n)
+{
+    if (g_udp_fd >= 0 && n > 0) {
+        ssize_t sent = sendto(g_udp_fd, s_udp_buf, (size_t)n, 0,
+                              (struct sockaddr *)&g_udp_dest,
+                              sizeof(g_udp_dest));
+        if (sent < 0) perror("SpatMapLog: sendto");
+    }
+}
+
+/*----------------------------------------------------------------------------*/
+/* Log SPAT — one JSON object per intersection                               */
+/*----------------------------------------------------------------------------*/
+static void Log_SPAT(const struct SAESPAT *pSPAT, uint64_t now_ms)
+{
+    if (pSPAT == NULL) return;
+
+    for (size_t i = 0; i < pSPAT->intersections.count; i++) {
+        const struct SAEIntersectionState *pIS = &pSPAT->intersections.tab[i];
+
+        int n = 0;
+        memset(s_udp_buf, 0, sizeof(s_udp_buf));
+
+        LOGF("{");
+        LOGF("\"msg_type\":\"SPAT\",");
+        LOGF("\"ts_rx_ms\":%" PRIu64 ",", now_ms);
+        LOGF("\"msg_cnt\":%d,",           (int)pSPAT->msgCnt);
+        LOGF("\"intersection_id\":%ld,",  (long)pIS->id.id);
+        LOGF("\"revision\":%d,",          (int)pIS->revision);
+        LOGF("\"status\":%d,",            (int)pIS->status);
+
+        if (pIS->moy_option)
+            LOGF("\"moy\":%ld,",          (long)pIS->moy);
+        else
+            LOGF("\"moy\":null,");
+
+        if (pIS->timeStamp_option)
+            LOGF("\"timestamp_ds\":%ld,", (long)pIS->timeStamp);
+        else
+            LOGF("\"timestamp_ds\":null,");
+
+        /* Movement states */
+        LOGF("\"states\":[");
+        for (size_t ms = 0; ms < pIS->states.count; ms++) {
+            const struct SAEMovementState *pM = &pIS->states.tab[ms];
+            LOGF("%s{", ms ? "," : "");
+            LOGF("\"signal_group\":%d,", (int)pM->signalGroup);
+            LOGF("\"events\":[");
+            for (size_t ev = 0; ev < pM->state_time_speed.count; ev++) {
+                const struct SAEMovementEvent *pE =
+                    &pM->state_time_speed.tab[ev];
+                LOGF("%s{", ev ? "," : "");
+                LOGF("\"event_state\":%d", (int)pE->eventState);
+                if (pE->timing_option) {
+                    const struct SAETimeChangeDetails *pT = &pE->timing;
+                    LOGF(",\"timing\":{");
+                    if (pT->startTime_option)
+                        LOGF("\"start_time\":%ld,",   (long)pT->startTime);
+                    else
+                        LOGF("\"start_time\":null,");
+                    if (pT->minEndTime_option)
+                        LOGF("\"min_end_time\":%ld,", (long)pT->minEndTime);
+                    else
+                        LOGF("\"min_end_time\":null,");
+                    if (pT->maxEndTime_option)
+                        LOGF("\"max_end_time\":%ld",  (long)pT->maxEndTime);
+                    else
+                        LOGF("\"max_end_time\":null");
+                    LOGF("}");
+                } else {
+                    LOGF(",\"timing\":null");
+                }
+                LOGF("}");
+            }
+            LOGF("]");   /* events */
+            LOGF("}");   /* state  */
+        }
+        LOGF("]");       /* states */
+        LOGF("}\n");
+
+        if (g_log_fp) fflush(g_log_fp);
+        SendUDP(n);
+    }
+}
+
+/*----------------------------------------------------------------------------*/
+/* Log MAP — reference point + intersection count                            */
+/*----------------------------------------------------------------------------*/
+static void Log_MAP(const struct SAEMapData *pMAP, uint64_t now_ms)
+{
+    if (pMAP == NULL) return;
+
+    int n = 0;
+    memset(s_udp_buf, 0, sizeof(s_udp_buf));
+
+    LOGF("{");
+    LOGF("\"msg_type\":\"MAP\",");
+    LOGF("\"ts_rx_ms\":%" PRIu64 ",",  now_ms);
+    LOGF("\"msg_cnt\":%d,",            (int)pMAP->msgIssueRevision);
+
+    size_t num = pMAP->intersections_option
+                 ? pMAP->intersections.count : 0;
+    LOGF("\"num_intersections\":%zu,", num);
+
+    LOGF("\"intersections\":[");
+    if (pMAP->intersections_option) {
+        for (size_t i = 0; i < pMAP->intersections.count; i++) {
+            const struct SAEIntersectionGeometry *pIG =
+                &pMAP->intersections.tab[i];
+            LOGF("%s{", i ? "," : "");
+            LOGF("\"intersection_id\":%ld,", (long)pIG->id.id);
+            LOGF("\"ref_lat_1e7\":%ld,",     (long)pIG->refPoint.lat);
+            LOGF("\"ref_lon_1e7\":%ld,",     (long)pIG->refPoint.Long);
+            LOGF("\"ref_lat_deg\":%.7f,",    pIG->refPoint.lat  * 1e-7);
+            LOGF("\"ref_lon_deg\":%.7f,",    pIG->refPoint.Long * 1e-7);
+            LOGF("\"num_lanes\":%zu",        pIG->laneSet.count);
+            LOGF("}");
+        }
+    }
+    LOGF("]");
+    LOGF("}\n");
+
+    if (g_log_fp) fflush(g_log_fp);
+    SendUDP(n);
+}
+
+/*----------------------------------------------------------------------------*/
+/* Ext callback                                                               */
+/*----------------------------------------------------------------------------*/
+static void SpatMapLog_ExtCallback(tExtEventId  Event,
+                                   tExtMessage *pMsg,
+                                   void        *pPriv)
+{
+    (void)pPriv;
+    if (Event != QSMSG_EXT_RX_WSM) return;
+    if (pMsg  == NULL)              return;
+    if (!g_initialized)             return;
+
+    uint64_t now_ms = Util_Now();
+
+    if (pMsg->pSAESPAT != NULL) {
+        fprintf(stderr, "SpatMapLog: SPAT rx — %zu intersection(s)\n",
+                pMsg->pSAESPAT->intersections.count);
+        Log_SPAT(pMsg->pSAESPAT, now_ms);
+        return;
+    }
+    if (pMsg->pSAEMAP != NULL) {
+        size_t ni = pMsg->pSAEMAP->intersections_option
+                    ? pMsg->pSAEMAP->intersections.count : 0;
+        fprintf(stderr, "SpatMapLog: MAP rx — %zu intersection(s)\n", ni);
+        Log_MAP(pMsg->pSAEMAP, now_ms);
+        return;
+    }
+}
+
+/*----------------------------------------------------------------------------*/
+/* SpatMapLog_Init                                                            */
+/*----------------------------------------------------------------------------*/
+int SpatMapLog_Init(const char *pStackConfigFilename)
+{
+    g_initialized = 0;
+    g_ext_handle  = -1;
+    if (g_log_fp)      { fclose(g_log_fp);  g_log_fp = NULL; }
+    if (g_udp_fd >= 0) { close(g_udp_fd);   g_udp_fd = -1;   }
+
+    /* Open log file */
+    char LogDir[512], LogPath[1024];
+    Log_GetLogDir(LogDir);
+    snprintf(LogPath, sizeof(LogPath), "%s/spatmap_log.jsonl", LogDir);
+
+    g_log_fp = fopen(LogPath, "w");
+    if (g_log_fp == NULL) {
+        fprintf(stderr, "SpatMapLog: ERROR opening %s: %s\n",
+                LogPath, strerror(errno));
+        return -1;
+    }
+    fprintf(stderr, "SpatMapLog: logging to %s\n", LogPath);
+
+    /* Read UDP config */
+    char udp_host[64];
+    int  udp_port = 0;
+    SpatMapLog_ReadConfig(pStackConfigFilename,
+                          udp_host, sizeof(udp_host), &udp_port);
+    fprintf(stderr, "SpatMapLog: UDP config — host=%s port=%d\n",
+            udp_host, udp_port);
+
+    /* Open UDP socket */
+    if (udp_port == 0) {
+        fprintf(stderr, "SpatMapLog: UDP disabled\n");
+        g_udp_fd = -1;
+    } else {
+        g_udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (g_udp_fd < 0) {
+            fprintf(stderr, "SpatMapLog: socket() failed — file only\n");
+        } else {
+            memset(&g_udp_dest, 0, sizeof(g_udp_dest));
+            g_udp_dest.sin_family      = AF_INET;
+            g_udp_dest.sin_port        = htons((uint16_t)udp_port);
+            g_udp_dest.sin_addr.s_addr = inet_addr(udp_host);
+            fprintf(stderr, "SpatMapLog: UDP forwarding to %s:%d\n",
+                    udp_host, udp_port);
+        }
+    }
+
+    /* Register Ext callback */
+    g_ext_handle = Ext_CallbackRegister(SpatMapLog_ExtCallback, NULL);
+    if (g_ext_handle < 0) {
+        fprintf(stderr, "SpatMapLog: Ext_CallbackRegister failed (%d)\n",
+                g_ext_handle);
+        if (g_log_fp)      { fclose(g_log_fp);  g_log_fp = NULL; }
+        if (g_udp_fd >= 0) { close(g_udp_fd);   g_udp_fd = -1;   }
+        return -2;
+    }
+
+    fprintf(stderr, "SpatMapLog: started (ext_handle=%d)\n", g_ext_handle);
+    g_initialized = 1;
+    return 0;
+}
+
+/*----------------------------------------------------------------------------*/
+/* SpatMapLog_Exit                                                            */
+/*----------------------------------------------------------------------------*/
+void SpatMapLog_Exit(void)
+{
+    g_initialized = 0;
+    if (g_ext_handle >= 0) {
+        Ext_CallbackDeregister(g_ext_handle);
+        g_ext_handle = -1;
+    }
+    if (g_log_fp)      { fclose(g_log_fp);  g_log_fp = NULL; }
+    if (g_udp_fd >= 0) { close(g_udp_fd);   g_udp_fd = -1;   }
+    fprintf(stderr, "SpatMapLog: stopped\n");
+}

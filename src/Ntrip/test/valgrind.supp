@@ -1,0 +1,30 @@
+{
+   <usual_dl_init>
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   fun:malloc
+   ...
+   fun:call_init
+   fun:_dl_init
+   ...
+}
+
+{
+   <pthtead_alloc>
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:calloc
+   fun:allocate_dtv
+   fun:_dl_allocate_tls
+   fun:allocate_stack
+   fun:pthread_create@@GLIBC_2.2.5
+   fun:Util_StartThread_
+   fun:NtripRx_ThreadInit
+   fun:NtripRx_Init
+   fun:Ntrip_Init
+   fun:Test_Ntrip
+   fun:TestCase_run
+   fun:TestCaller_run
+   fun:TextUIRunner_runTest
+   fun:main
+}
